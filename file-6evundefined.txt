@@ -1,0 +1,647 @@
+/* SolMeme Bot — app logic */
+(async () => {
+
+  /* ---------- polyfills + libs ---------- */
+  const { Buffer } = await import('https://esm.sh/buffer@6.0.3')
+  globalThis.Buffer = globalThis.Buffer || Buffer
+
+  const web3 = await import('https://esm.sh/@solana/web3.js@1.95.4?bundle&target=es2022')
+  const bs58 = (await import('https://esm.sh/bs58@6.0.0')).default
+
+  const {
+    Connection, Keypair, PublicKey, VersionedTransaction, Transaction,
+    SystemProgram, LAMPORTS_PER_SOL
+  } = web3
+
+  const PL = (window.Capacitor && window.Capacitor.Plugins) || {}
+  const $ = (id) => document.getElementById(id)
+
+  /* ---------- storage ---------- */
+  const store = {
+    async get(k) {
+      try {
+        if (PL.Preferences) { const r = await PL.Preferences.get({ key: k }); return r.value }
+      } catch {}
+      return localStorage.getItem(k)
+    },
+    async set(k, v) {
+      try {
+        if (PL.Preferences) return await PL.Preferences.set({ key: k, value: v })
+      } catch {}
+      localStorage.setItem(k, v)
+    }
+  }
+
+  /* ---------- constants ---------- */
+  const SOL_MINT = 'So11111111111111111111111111111111111111112'
+  const JUP = 'https://lite-api.jup.ag/swap/v1'
+  const JITO_URL = 'https://mainnet.block-engine.jito.wtf/api/v1/bundles'
+  const JITO_TIPS = [
+    '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
+    'HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe',
+    'Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY',
+    'ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49',
+    'DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh',
+    'ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt',
+    'DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL',
+    '3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT'
+  ]
+  const DS = 'https://api.dexscreener.com'
+
+  /* ---------- log ---------- */
+  const logEl = $('log')
+  const lines = []
+  function log(msg, cls = '') {
+    const t = new Date().toLocaleTimeString('en-GB', { hour12: false })
+    lines.push(`<span class="d">${t}</span> <span class="${cls}">${msg}</span>`)
+    if (lines.length > 400) lines.shift()
+    logEl.innerHTML = lines.join('\n')
+    logEl.scrollTop = logEl.scrollHeight
+  }
+
+  /* ---------- telegram ---------- */
+  let cfg = {}
+  async function tg(text) {
+    if (!cfg.tgToken || !cfg.tgChat) return
+    try {
+      await fetch(`https://api.telegram.org/bot${cfg.tgToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: cfg.tgChat, text, parse_mode: 'HTML' })
+      })
+    } catch {}
+  }
+
+  /* ---------- wallet helpers ---------- */
+  function keypairFrom(secret) {
+    const s = (secret || '').trim()
+    if (!s) throw new Error('no private key')
+    if (s.startsWith('[')) return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(s)))
+    return Keypair.fromSecretKey(bs58.decode(s))
+  }
+
+  function parseMint(data) {
+    const b = data instanceof Uint8Array ? data : new Uint8Array(data)
+    if (b.length < 82) throw new Error('bad mint account')
+    const dv = new DataView(b.buffer, b.byteOffset, b.byteLength)
+    const mintOpt = dv.getUint32(0, true)
+    const freezeOpt = dv.getUint32(46, true)
+    return {
+      mintAuth: mintOpt ? bs58.encode(b.slice(4, 36)) : null,
+      freezeAuth: freezeOpt ? bs58.encode(b.slice(50, 82)) : null,
+      supply: dv.getBigUint64(36, true),
+      decimals: b[44]
+    }
+  }
+
+  async function mintSafety(conn, mint) {
+    const info = await conn.getAccountInfo(new PublicKey(mint))
+    if (!info) throw new Error('mint not found')
+    return parseMint(info.data)
+  }
+
+  async function top10Pct(conn, mint) {
+    try {
+      const largest = await conn.getTokenLargestAccounts(new PublicKey(mint))
+      const info = await conn.getAccountInfo(new PublicKey(mint))
+      const total = Number(parseMint(info.data).supply)
+      if (!total) return 100
+      const top = largest.value.slice(0, 10).reduce((a, v) => a + Number(v.amount), 0)
+      return (top / total) * 100
+    } catch { return 100 }
+  }
+
+  async function tokenBalance(conn, owner, mint) {
+    try {
+      const r = await conn.getParsedTokenAccountsByOwner(owner, { mint: new PublicKey(mint) })
+      return r.value[0]?.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0
+    } catch { return 0 }
+  }
+
+  /* ---------- jupiter ---------- */
+  async function getQuote(inMint, outMint, amount, slip) {
+    const r = await fetch(`${JUP}/quote?inputMint=${inMint}&outputMint=${outMint}&amount=${amount}&slippageBps=${slip}`)
+    if (!r.ok) throw new Error('quote ' + r.status)
+    const j = await r.json()
+    if (!j || !j.outAmount) throw new Error('no route')
+    return j
+  }
+
+  async function buildSwap(kp, quote, useJito) {
+    const r = await fetch(`${JUP}/swap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        quoteResponse: quote,
+        userPublicKey: kp.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: useJito ? 1000 : 'auto'
+      })
+    })
+    if (!r.ok) throw new Error('swap build ' + r.status)
+    const { swapTransaction } = await r.json()
+    const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, 'base64'))
+    tx.sign([kp])
+    return tx
+  }
+
+  async function sendJito(conn, kp, swapTx, tipLamports) {
+    const tipAcct = JITO_TIPS[Math.floor(Math.random() * JITO_TIPS.length)]
+    const tipTx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: kp.publicKey,
+        toPubkey: new PublicKey(tipAcct),
+        lamports: tipLamports
+      })
+    )
+    tipTx.recentBlockhash = swapTx.message.recentBlockhash
+    tipTx.feePayer = kp.publicKey
+    tipTx.sign(kp)
+
+    const r = await fetch(JITO_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'sendBundle',
+        params: [[bs58.encode(swapTx.serialize()), bs58.encode(tipTx.serialize())]]
+      })
+    })
+    const j = await r.json()
+    if (j.error) throw new Error(j.error.message || 'jito error')
+    return bs58.encode(swapTx.signatures[0])
+  }
+
+  async function execute(conn, kp, quote) {
+    const useJito = !!cfg.jito
+    const tx = await buildSwap(kp, quote, useJito)
+    if (useJito) {
+      try {
+        const sig = await sendJito(conn, kp, tx, cfg.jitoTip || 100000)
+        log('  jito bundle submitted', 'p')
+        return sig
+      } catch (e) {
+        log('  jito failed (' + e.message + '), falling back to RPC', 'y')
+      }
+    }
+    const sig = await conn.sendRawTransaction(tx.serialize(), { maxRetries: 3 })
+    return sig
+  }
+
+  async function confirm(conn, sig) {
+    const bh = await conn.getLatestBlockhash('confirmed')
+    await conn.confirmTransaction({ signature: sig, ...bh }, 'confirmed')
+  }
+
+  /* ---------- dexscreener ---------- */
+  async function dexInfo(mint) {
+    try {
+      const r = await fetch(`${DS}/latest/dex/tokens/${mint}`)
+      if (!r.ok) return null
+      const j = await r.json()
+      const pairs = (j.pairs || []).filter(p => p.chainId === 'solana')
+      if (!pairs.length) return null
+      pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))
+      return pairs[0]
+    } catch { return null }
+  }
+
+  async function discover() {
+    const out = new Set()
+    try {
+      const r = await fetch(`${DS}/token-boosts/top/v1`)
+      const j = await r.json()
+      for (const t of (j || [])) if (t.chainId === 'solana') out.add(t.tokenAddress)
+    } catch {}
+    try {
+      const r = await fetch(`${DS}/latest/dex/search?q=SOL`)
+      const j = await r.json()
+      const pairs = (j.pairs || [])
+        .filter(p => p.chainId === 'solana')
+        .sort((a, b) => (b.volume?.h24 || 0) - (a.volume?.h24 || 0))
+      for (const p of pairs.slice(0, 60)) out.add(p.baseToken.address)
+    } catch {}
+    return [...out].slice(0, cfg.discMax || 25)
+  }
+
+  /* ---------- bot ---------- */
+  let bot = null
+
+  class Bot {
+    constructor(c, kp) {
+      this.cfg = c
+      this.kp = kp
+      this.conn = new Connection(c.rpc, 'confirmed')
+      this.positions = []
+      this.trades = 0
+      this.timer = null
+      this.running = false
+      this.dayEquity = 0
+      this.dayStart = Date.now()
+      this.halted = false
+      this.discovered = []
+      this.lastDisc = 0
+    }
+
+    async start() {
+      if (this.running) return
+      this.running = true
+      this.dayStart = Date.now()
+      this.dayEquity = await this.conn.getBalance(this.kp.publicKey).then(b => b / LAMPORTS_PER_SOL)
+      log(`bot started ${this.cfg.dryRun ? '[DRY RUN]' : '[LIVE]'}`, 'y')
+      tg(`🤖 <b>Bot started</b>\nMode: ${this.cfg.dryRun ? 'DRY RUN' : 'LIVE'}\nSize: ${this.cfg.size} SOL`)
+      this.tick()
+      this.timer = setInterval(() => this.tick(), this.cfg.interval * 1000)
+    }
+
+    stop() {
+      this.running = false
+      if (this.timer) clearInterval(this.timer)
+      this.timer = null
+      log('bot stopped', 'd')
+      tg('🛑 <b>Bot stopped</b>')
+      render()
+    }
+
+    async tick() {
+      try {
+        const bal = await this.conn.getBalance(this.kp.publicKey).then(b => b / LAMPORTS_PER_SOL)
+
+        // kill switch
+        if (!this.dayEquity) this.dayEquity = bal
+        if (Date.now() - this.dayStart > 86400000) {
+          this.dayStart = Date.now(); this.dayEquity = bal; this.halted = false
+        }
+        const dd = ((this.dayEquity - bal) / this.dayEquity) * 100
+        if (!this.halted && dd >= this.cfg.dailyLoss) {
+          this.halted = true
+          log(`KILL SWITCH — wallet down ${dd.toFixed(1)}% today`, 'r')
+          tg(`🚨 <b>KILL SWITCH</b>\nWallet down ${dd.toFixed(1)}% in 24h. Bot halted.`)
+        }
+        if (this.halted) { render(); return }
+
+        const exposure = this.positions.reduce((a, p) => a + p.sizeSol, 0)
+        log(`tick · ${bal.toFixed(3)} SOL · open ${this.positions.length} · exp ${exposure.toFixed(2)}`, 'd')
+
+        await this.exits(bal)
+        await this.entries(bal, exposure)
+        render()
+      } catch (e) {
+        log('tick error: ' + e.message, 'r')
+      }
+    }
+
+    async exits(bal) {
+      for (const p of [...this.positions]) {
+        const info = await dexInfo(p.mint)
+        if (!info) continue
+        const price = parseFloat(info.priceUsd || '0')
+        if (!price) continue
+        if (price > p.peakUsd) p.peakUsd = price
+
+        const pnl = ((price - p.entryUsd) / p.entryUsd) * 100
+        const drop = ((p.peakUsd - price) / p.peakUsd) * 100
+        const held = (Date.now() - p.openedAt) / 3600000
+
+        let reason = ''
+        if (pnl <= -this.cfg.sl) reason = `stop loss ${pnl.toFixed(1)}%`
+        else if (held >= this.cfg.timeStopH && pnl < 10) reason = `time stop ${held.toFixed(1)}h`
+        else if (p.peakUsd > p.entryUsd && drop >= this.cfg.trail && pnl > 0) reason = `trailing stop`
+        else if (!p.halfSold && pnl >= this.cfg.tp) {
+          await this.sell(p, 0.5, `take profit +${pnl.toFixed(0)}%`)
+          p.halfSold = true
+          continue
+        }
+        if (reason) await this.sell(p, 1, reason)
+      }
+    }
+
+    async sell(p, frac, reason) {
+      const amt = await tokenBalance(this.conn, this.kp.publicKey, p.mint)
+      if (amt <= 0) {
+        log(`${p.symbol}: zero balance, closing`, 'y')
+        this.positions = this.positions.filter(x => x.mint !== p.mint)
+        return
+      }
+      const sellAmt = Math.floor(amt * frac)
+      if (sellAmt <= 0) return
+
+      log(`SELL ${p.symbol} ${frac * 100}% — ${reason}`, 'r')
+      tg(`🔴 <b>SELL</b> ${p.symbol}\n${frac * 100}% — ${reason}`)
+
+      if (this.cfg.dryRun) {
+        this.trades++
+        if (frac >= 1) this.positions = this.positions.filter(x => x.mint !== p.mint)
+        return
+      }
+      try {
+        const safety = await mintSafety(this.conn, p.mint)
+        const raw = Math.floor(sellAmt * Math.pow(10, safety.decimals))
+        const q = await getQuote(p.mint, SOL_MINT, raw, this.cfg.slippageBps)
+        const sig = await execute(this.conn, this.kp, q)
+        await confirm(this.conn, sig)
+        log(`  sold → ${sig.slice(0, 10)}…`, 'g')
+        this.trades++
+        if (frac >= 1) this.positions = this.positions.filter(x => x.mint !== p.mint)
+      } catch (e) {
+        log('  sell failed: ' + e.message, 'r')
+      }
+    }
+
+    async entries(bal, exposure) {
+      if (this.positions.length >= this.cfg.maxPos) return
+      if (bal < this.cfg.size + 0.02) return
+      if (exposure + this.cfg.size > bal * 0.9) return
+
+      // refresh discovery
+      if (this.cfg.autoDiscover && Date.now() - this.lastDisc > 600000) {
+        this.lastDisc = Date.now()
+        this.discovered = await discover()
+        log(`discovery: ${this.discovered.length} candidates`, 'p')
+      }
+
+      const pool = [...new Set([...(this.cfg.watchlist || []), ...(this.cfg.autoDiscover ? this.discovered : [])])]
+      if (!pool.length) { log('no candidates', 'd'); return }
+
+      for (const mint of pool) {
+        if (this.positions.length >= this.cfg.maxPos) break
+        if (this.positions.find(p => p.mint === mint)) continue
+
+        const info = await dexInfo(mint)
+        if (!info) continue
+
+        const symbol = info.baseToken?.symbol || mint.slice(0, 6)
+        const liq = info.liquidity?.usd || 0
+        const price = parseFloat(info.priceUsd || '0')
+        const ageDays = info.pairCreatedAt ? (Date.now() - info.pairCreatedAt) / 86400000 : 99
+        const ageMin = ageDays * 1440
+        const chg5m = info.priceChange?.m5 ?? 0
+
+        if (liq < this.cfg.minLiq) continue
+        if (ageMin < 5) continue
+        if (ageDays > this.cfg.discAge) continue
+        if (!price) continue
+
+        let safety
+        try { safety = await mintSafety(this.conn, mint) } catch { continue }
+        if (safety.mintAuth) continue
+        if (safety.freezeAuth) continue
+
+        const top10 = await top10Pct(this.conn, mint)
+        if (top10 > this.cfg.maxTop) continue
+        if (chg5m <= 0) continue
+
+        let score = 10, why = 'filters only'
+        if (this.cfg.vkey) {
+          const ai = await this.score(symbol, info)
+          score = ai.score; why = ai.reason
+          if (score < this.cfg.aiMin) { log(`${symbol}: AI ${score}/10 — ${why}`, 'd'); continue }
+        }
+
+        log(`BUY ${symbol} · ${this.cfg.size} SOL · liq $${Math.round(liq)} · AI ${score}/10 — ${why}`, 'g')
+        await this.buy(mint, symbol, price)
+      }
+    }
+
+    async buy(mint, symbol, price) {
+      const lamports = Math.floor(this.cfg.size * LAMPORTS_PER_SOL)
+      if (this.cfg.dryRun) {
+        this.positions.push({ mint, symbol, entryUsd: price, sizeSol: this.cfg.size, openedAt: Date.now(), peakUsd: price, halfSold: false })
+        this.trades++
+        tg(`🟢 <b>BUY</b> ${symbol}\n${this.cfg.size} SOL @ $${price.toFixed(8)}`)
+        render()
+        return
+      }
+      try {
+        const q = await getQuote(SOL_MINT, mint, lamports, this.cfg.slippageBps)
+        const sig = await execute(this.conn, this.kp, q)
+        await confirm(this.conn, sig)
+        this.positions.push({ mint, symbol, entryUsd: price, sizeSol: this.cfg.size, openedAt: Date.now(), peakUsd: price, halfSold: false })
+        this.trades++
+        log(`  bought → ${sig.slice(0, 10)}…`, 'g')
+        tg(`🟢 <b>BUY</b> ${symbol}\n${this.cfg.size} SOL\nhttps://solscan.io/tx/${sig}`)
+        render()
+      } catch (e) {
+        log('  buy failed: ' + e.message, 'r')
+      }
+    }
+
+    async score(symbol, info) {
+      const payload = {
+        symbol,
+        name: info.baseToken?.name,
+        liquidityUsd: info.liquidity?.usd,
+        fdv: info.fdv,
+        vol24h: info.volume?.h24,
+        change5m: info.priceChange?.m5,
+        change1h: info.priceChange?.h1,
+        ageHours: info.pairCreatedAt ? (Date.now() - info.pairCreatedAt) / 3600000 : null
+      }
+      try {
+        const r = await fetch('https://api.venice.ai/api/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${this.cfg.vkey}` },
+          body: JSON.stringify({
+            model: this.cfg.vmodel,
+            temperature: 0.2,
+            max_tokens: 120,
+            messages: [
+              { role: 'system', content: 'Score Solana meme coins for short-term trade quality. Reply ONLY with JSON: {"score": <0-10>, "reason": "<8 words>"}. Penalise thin liquidity vs FDV, low volume vs liquidity, clone tickers, absurd FDV. Reward healthy volume/liquidity, established age, clean momentum.' },
+              { role: 'user', content: JSON.stringify(payload) }
+            ]
+          })
+        })
+        if (!r.ok) throw new Error('venice ' + r.status)
+        const j = await r.json()
+        const txt = j.choices?.[0]?.message?.content || ''
+        const m = txt.match(/\{[\s\S]*\}/)
+        if (!m) throw new Error('bad json')
+        const p = JSON.parse(m[0])
+        return { score: Number(p.score) || 5, reason: String(p.reason || '').slice(0, 60) }
+      } catch (e) {
+        log('AI error: ' + e.message, 'y')
+        return { score: 6, reason: 'ai unavailable' }
+      }
+    }
+  }
+
+  /* ---------- UI ---------- */
+  function readForm() {
+    return {
+      rpc: $('rpc').value.trim() || 'https://api.mainnet-beta.solana.com',
+      dryRun: $('modePill').textContent === 'DRY RUN',
+      size: parseFloat($('size').value) || 0.15,
+      slippageBps: parseInt($('slip').value) || 200,
+      minLiq: parseFloat($('minLiq').value) || 30000,
+      maxTop: parseFloat($('maxTop').value) || 25,
+      sl: parseFloat($('sl').value) || 25,
+      tp: parseFloat($('tp').value) || 50,
+      trail: parseFloat($('trail').value) || 20,
+      timeStopH: parseFloat($('ts').value) || 24,
+      maxPos: parseInt($('maxPos').value) || 3,
+      interval: Math.max(15, parseInt($('ivl').value) || 45),
+      dailyLoss: parseFloat($('dailyLoss').value) || 10,
+      autoDiscover: $('tDisc').classList.contains('on'),
+      discMax: parseInt($('discMax').value) || 25,
+      discAge: parseFloat($('discAge').value) || 7,
+      jito: $('tJito').classList.contains('on'),
+      jitoTip: parseInt($('jitoTip').value) || 100000,
+      vkey: $('vkey').value.trim(),
+      vmodel: $('vmodel').value.trim() || 'llama-3.3-70b',
+      aiMin: parseFloat($('aiscore').value) || 6,
+      tgToken: $('tgToken').value.trim(),
+      tgChat: $('tgChat').value.trim(),
+      watchlist: cfg.watchlist || []
+    }
+  }
+
+  function writeForm(c) {
+    $('rpc').value = c.rpc
+    $('size').value = c.size
+    $('slip').value = c.slippageBps
+    $('minLiq').value = c.minLiq
+    $('maxTop').value = c.maxTop
+    $('sl').value = c.sl
+    $('tp').value = c.tp
+    $('trail').value = c.trail
+    $('ts').value = c.timeStopH
+    $('maxPos').value = c.maxPos
+    $('ivl').value = c.interval
+    $('dailyLoss').value = c.dailyLoss
+    $('discMax').value = c.discMax
+    $('discAge').value = c.discAge
+    $('jitoTip').value = c.jitoTip
+    $('vkey').value = c.vkey
+    $('vmodel').value = c.vmodel
+    $('aiscore').value = c.aiMin
+    $('tgToken').value = c.tgToken || ''
+    $('tgChat').value = c.tgChat || ''
+    $('modePill').textContent = c.dryRun ? 'DRY RUN' : 'LIVE'
+    $('modePill').className = 'pill ' + (c.dryRun ? 'dry' : 'on')
+    $('tDisc').className = 'toggle' + (c.autoDiscover ? ' on' : '')
+    $('tJito').className = 'toggle' + (c.jito ? ' on' : '')
+  }
+
+  function render() {
+    const p = bot ? bot.positions : []
+    $('positions').innerHTML = p.length
+      ? p.map(x => `<div class="pos"><div class="t"><span>${x.symbol}</span><span class="d">${x.sizeSol} SOL</span></div><div class="mint">${x.mint}</div></div>`).join('')
+      : '<div class="d" style="font-size:12px">none</div>'
+    $('sPos').textContent = String(p.length)
+    $('sExp').textContent = p.reduce((a, x) => a + x.sizeSol, 0).toFixed(2)
+    $('sTrd').textContent = String(bot ? bot.trades : 0)
+  }
+
+  function renderWatch() {
+    const w = cfg.watchlist || []
+    $('watch').innerHTML = w.length
+      ? w.map(m => `<div class="pos"><div class="t"><span>${m.slice(0, 6)}…${m.slice(-4)}</span><span data-del="${m}" style="color:var(--red)">remove</span></div><div class="mint">${m}</div></div>`).join('')
+      : '<div class="d" style="font-size:12px">empty — auto-discovery will find tokens for you</div>'
+    $('watch').querySelectorAll('[data-del]').forEach(el => {
+      el.onclick = async () => {
+        cfg.watchlist = cfg.watchlist.filter(x => x !== el.dataset.del)
+        await persist(); renderWatch()
+      }
+    })
+  }
+
+  async function persist() {
+    await store.set('solbot.cfg', JSON.stringify(cfg))
+    await store.set('solbot.pk', $('pk').value.trim())
+  }
+
+  async function boot() {
+    const raw = await store.get('solbot.cfg')
+    const def = {
+      rpc: 'https://api.mainnet-beta.solana.com', dryRun: true, size: 0.15, slippageBps: 200,
+      minLiq: 30000, maxTop: 25, sl: 25, tp: 50, trail: 20, timeStopH: 24, maxPos: 3,
+      interval: 45, dailyLoss: 10, autoDiscover: true, discMax: 25, discAge: 7,
+      jito: true, jitoTip: 100000, vkey: '', vmodel: 'llama-3.3-70b', aiMin: 6,
+      tgToken: '', tgChat: '', watchlist: []
+    }
+    cfg = raw ? { ...def, ...JSON.parse(raw) } : def
+    const pk = await store.get('solbot.pk')
+    if (pk) $('pk').value = pk
+    writeForm(cfg)
+    renderWatch(); render()
+    log('ready — paste key, tap Test Connection', 'd')
+  }
+
+  /* toggles */
+  $('modePill').onclick = () => {
+    const dry = $('modePill').textContent === 'DRY RUN'
+    $('modePill').textContent = dry ? 'LIVE' : 'DRY RUN'
+    $('modePill').className = 'pill ' + (dry ? 'on' : 'dry')
+    log(dry ? 'LIVE MODE — real funds' : 'dry run', 'y')
+  }
+  $('tDisc').onclick = () => $('tDisc').classList.toggle('on')
+  $('tJito').onclick = () => $('tJito').classList.toggle('on')
+
+  $('btnSave').onclick = async () => {
+    cfg = readForm()
+    await persist()
+    log('saved', 'g')
+  }
+
+  $('btnTest').onclick = async () => {
+    try {
+      const kp = keypairFrom($('pk').value)
+      const conn = new Connection($('rpc').value.trim(), 'confirmed')
+      const v = await conn.getVersion()
+      const b = await conn.getBalance(kp.publicKey)
+      $('sBal').textContent = (b / LAMPORTS_PER_SOL).toFixed(3)
+      log(`connected · rpc v${v['solana-core']} · ${kp.publicKey.toBase58().slice(0, 8)}… · ${(b / LAMPORTS_PER_SOL).toFixed(4)} SOL`, 'g')
+    } catch (e) {
+      log('connection failed: ' + e.message, 'r')
+    }
+  }
+
+  $('btnTg').onclick = async () => {
+    cfg = readForm()
+    if (!cfg.tgToken || !cfg.tgChat) return log('need token and chat id', 'y')
+    await persist()
+    await tg('✅ <b>SolMeme Bot</b> test alert — Telegram is working.')
+    log('telegram test sent', 'g')
+  }
+
+  $('btnAdd').onclick = async () => {
+    const m = $('newMint').value.trim()
+    if (m.length < 32) return log('invalid mint', 'r')
+    cfg.watchlist = [...(cfg.watchlist || []), m]
+    $('newMint').value = ''
+    await persist(); renderWatch()
+  }
+
+  $('btnClear').onclick = () => { lines.length = 0; logEl.innerHTML = '' }
+
+  $('btnStart').onclick = async () => {
+    if (bot && bot.running) return log('already running', 'y')
+    try {
+      cfg = readForm()
+      await persist()
+      const kp = keypairFrom($('pk').value)
+      bot = new Bot(cfg, kp)
+      await bot.start()
+      $('statePill').textContent = 'RUNNING'
+      $('statePill').className = 'pill on'
+      try {
+        if (PL.ForegroundService) {
+          await PL.ForegroundService.start({
+            id: 1, title: 'SolMeme Bot', message: 'Trading loop active', buttonTitle: ''
+          })
+        }
+      } catch {}
+    } catch (e) {
+      log('start failed: ' + e.message, 'r')
+    }
+  }
+
+  $('btnStop').onclick = async () => {
+    if (bot) bot.stop()
+    $('statePill').textContent = 'STOPPED'
+    $('statePill').className = 'pill off'
+    try { if (PL.ForegroundService) await PL.ForegroundService.stop() } catch {}
+  }
+
+  boot()
+})()

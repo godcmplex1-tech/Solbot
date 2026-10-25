@@ -1,0 +1,124 @@
+
+
+<h1>SolMeme Bot</h1>
+<div class="sub">Solana meme-coin bot · runs on-device</div>
+
+<div class="card">
+  <h2>Status</h2>
+  <div style="margin-bottom:11px">
+    <span id="statePill" class="pill off">STOPPED</span>
+    <span id="modePill" class="pill dry">DRY RUN</span>
+  </div>
+  <div class="grid2">
+    <div class="stat"><div class="k">Wallet</div><div class="v" id="sBal">–</div></div>
+    <div class="stat"><div class="k">Open</div><div class="v" id="sPos">0</div></div>
+    <div class="stat"><div class="k">Exposure</div><div class="v" id="sExp">0</div></div>
+    <div class="stat"><div class="k">Trades</div><div class="v" id="sTrd">0</div></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Wallet &amp; Network</h2>
+  <label>Phantom private key (base58)</label>
+  <input id="pk" type="password" placeholder="paste exported key" autocomplete="off">
+  <div class="hint">Phantom → Settings → Export Private Key. Use a fresh wallet, not your main stack.</div>
+  <label>RPC URL</label>
+  <input id="rpc" value="https://api.mainnet-beta.solana.com">
+  <div class="hint">Public RPC rate-limits. A free Helius key makes this far more reliable.</div>
+  <button id="btnTest" style="margin-top:12px;width:100%">Test Connection</button>
+</div>
+
+<div class="card">
+  <h2>Trading</h2>
+  <div class="row">
+    <div><label>Size per trade (SOL)</label><input id="size" type="number" step="0.05" value="0.15"></div>
+    <div><label>Max positions</label><input id="maxPos" type="number" value="3"></div>
+  </div>
+  <div class="row">
+    <div><label>Stop loss %</label><input id="sl" type="number" value="25"></div>
+    <div><label>Take profit %</label><input id="tp" type="number" value="50"></div>
+  </div>
+  <div class="row">
+    <div><label>Trailing %</label><input id="trail" type="number" value="20"></div>
+    <div><label>Time stop (h)</label><input id="ts" type="number" value="24"></div>
+  </div>
+  <div class="row">
+    <div><label>Slippage (bps)</label><input id="slip" type="number" value="200"></div>
+    <div><label>Loop (sec)</label><input id="ivl" type="number" value="45"></div>
+  </div>
+  <div class="row">
+    <div><label>Min liquidity $</label><input id="minLiq" type="number" value="30000"></div>
+    <div><label>Max top10 %</label><input id="maxTop" type="number" value="25"></div>
+  </div>
+  <label>Daily loss kill switch %</label>
+  <input id="dailyLoss" type="number" value="10">
+  <div class="hint">Bot halts itself for the day if the wallet drops this much.</div>
+</div>
+
+<div class="card">
+  <h2>Auto-Discovery</h2>
+  <div class="sw"><span>Find tokens automatically</span><div id="tDisc" class="toggle"></div></div>
+  <div class="row" style="margin-top:10px">
+    <div><label>Max candidates</label><input id="discMax" type="number" value="25"></div>
+    <div><label>Max age (days)</label><input id="discAge" type="number" value="7"></div>
+  </div>
+  <div class="hint">Pulls trending Solana tokens from DexScreener. Manual watchlist is still scanned too.</div>
+</div>
+
+<div class="card">
+  <h2>Execution</h2>
+  <div class="sw"><span>Use Jito bundles</span><div id="tJito" class="toggle"></div></div>
+  <label>Jito tip (lamports)</label>
+  <input id="jitoTip" type="number" value="100000">
+  <div class="hint">Better inclusion during congestion. Costs ~0.0001 SOL per trade. Falls back to normal send if it fails.</div>
+</div>
+
+<div class="card">
+  <h2>AI Scoring (optional)</h2>
+  <label>Venice API key</label>
+  <input id="vkey" type="password" placeholder="blank = disable AI" autocomplete="off">
+  <div class="row">
+    <div><label>Model</label><input id="vmodel" value="llama-3.3-70b"></div>
+    <div><label>Min score</label><input id="aiscore" type="number" value="6"></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Telegram Alerts</h2>
+  <label>Bot token</label>
+  <input id="tgToken" placeholder="123456:ABC-DEF...">
+  <label>Chat ID</label>
+  <input id="tgChat" placeholder="your numeric chat id">
+  <button id="btnTg" style="margin-top:11px;width:100%">Send Test Alert</button>
+  <div class="hint">Message @BotFather on Telegram → /newbot → copy token. Then message your bot once and open
+    api.telegram.org/bot&lt;TOKEN&gt;/getUpdates to find your chat id.</div>
+</div>
+
+<div class="card">
+  <h2>Watchlist (optional)</h2>
+  <div class="row">
+    <input id="newMint" placeholder="token mint address">
+    <button id="btnAdd" style="flex:0 0 78px">Add</button>
+  </div>
+  <div id="watch" style="margin-top:11px"></div>
+</div>
+
+<div class="card">
+  <h2>Open Positions</h2>
+  <div id="positions"><div class="d" style="font-size:12px">none</div></div>
+</div>
+
+<div class="card">
+  <h2>Log</h2>
+  <div id="log"></div>
+  <button id="btnClear" style="margin-top:9px;width:100%">Clear Log</button>
+</div>
+
+<div class="bar">
+  <button id="btnSave">Save</button>
+  <button id="btnStart" class="go">Start</button>
+  <button id="btnStop" class="stop">Stop</button>
+</div>
+
+
+

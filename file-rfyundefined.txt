@@ -1,0 +1,5 @@
+{
+  "appId": "ai.solmeme.bot",
+  "appName": "SolMeme Bot",
+  "webDir": "www"
+}
